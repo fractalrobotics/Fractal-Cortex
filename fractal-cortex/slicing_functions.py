@@ -187,6 +187,14 @@ def create_brim(shapely_polygons, lineWidth, brim_lines):
 def fix_polygon_or_multipolygon_ring_orientation(geometry):
     """Fixes the orientation (ccw VS cw) of rings in a polygon or multipolygon"""
     
+    # Une geometrie vide ou degeneree (aire nulle) fait planter orient() de
+    # shapely : signed_area() indexe coords[1] sur une sequence vide.
+    # Ces cas viennent de plans de coupe tangents a une face -- il n'y a rien
+    # a orienter, on renvoie tel quel. Sans cette garde, l'exception remonte
+    # et se fait avaler plus haut, ce qui masquerait aussi les vraies pannes.
+    if geometry.is_empty or geometry.area == 0.0:
+        return geometry
+
     if geometry.geom_type == "Polygon":
         returnedGeometry = orient(geometry, sign=1.0)
     elif geometry.geom_type == "MultiPolygon":
@@ -383,8 +391,13 @@ def get_manifold_areas_for_one_chunk(innerMostPolygonsList, infillPercentage, sh
                                 print("1. Error Processing Layer", str(layer), str(e))
                     else:                                                                                               # If there are no manifold areas on this layer, then whatever the current layer area is gets set equal to the internal area for this layer
                         internalAreas[layer].append(currentLayerArea)
-                except Exception as e:                                                                                  # If there is some problem with the area calculations, just skip this layer to move on
-                    print("2. Error Processing Layer", str(layer), str(e))
+                except Exception as e:                                                                                  # Les degenerescences sont filtrees en amont : toute exception
+                    # restante est une vraie panne de calcul d'aire. On refuse de
+                    # produire un G-code silencieusement ampute.
+                    raise RuntimeError(
+                        f"Echec du calcul d'aire sur la couche {layer} : {type(e).__name__}: {e}. "
+                        f"Le G-code serait incomplet -- slicing interrompu."
+                    ) from e
 
     warnings.resetwarnings()                                                                                            # Turns warnings back to warnings instead of errors
     return manifoldAreas, internalAreas
@@ -803,7 +816,25 @@ def all_5_axis_calculations(mesh, printSettings, slicingDirections):
         for k in range(int(numSlicingDirections)):
             currentStart = startingPositions[k]
             currentNormal = spherical_to_normal(*directions[k])
-            unprocessedChunk = mesh.slice_plane(currentStart, currentNormal, cap=True, face_index=None, cached_dots=None)
+            # slice_plane(cap=True) laisse trimesh trianguler le bouchon, ce qui
+            # produit des sections transverses degenerees juste sous la coupe
+            # (`unable to recover polygon!` a l'etape de slicing). On passe par
+            # une intersection booleenne avec un demi-espace : manifold3d est
+            # nettement plus robuste et rend le meme volume avec moins de faces.
+            # Repli sur la methode d'origine si l'intersection echoue.
+            try:
+                _ext = float(np.linalg.norm(mesh.extents)) * 3.0
+                _box = trimesh.creation.box(extents=(_ext, _ext, _ext))
+                _box.apply_translation((0.0, 0.0, _ext / 2.0))   # face -Z sur le plan
+                _box.apply_transform(trimesh.geometry.align_vectors([0, 0, 1], np.asarray(currentNormal, dtype=float)))
+                _box.apply_translation(np.asarray(currentStart, dtype=float))
+                unprocessedChunk = mesh.intersection(_box)
+                if unprocessedChunk.is_empty or len(unprocessedChunk.faces) == 0:
+                    raise ValueError("intersection demi-espace vide")
+            except Exception as _e:
+                print(f"Chunk {k}: intersection demi-espace indisponible ({type(_e).__name__}: {_e}), "
+                      f"repli sur slice_plane(cap=True)")
+                unprocessedChunk = mesh.slice_plane(currentStart, currentNormal, cap=True, face_index=None, cached_dots=None)
             chunkList.append(unprocessedChunk)
         '''
         Then, for each chunk, gradually chisel away material starting from the lattermost chunk and working backwards until the current chunk index.
@@ -913,10 +944,11 @@ def all_5_axis_calculations(mesh, printSettings, slicingDirections):
 
         return chunk_slice_levels
 
-    global stopSlicing
+    global stopSlicing, collisionDetail
     stopSlicing = False
+    collisionDetail = None
     def checkForBedNozzleCollisions(chunk, meshSections, transform3DList):
-        global stopSlicing
+        global stopSlicing, collisionDetail
         minAcceptableBedToNozzleClearance = 12.0
         paths_3D = []
         for layer, path2D in enumerate(meshSections): # Turn 2D paths into 3D paths to make global Z values known
@@ -934,6 +966,15 @@ def all_5_axis_calculations(mesh, printSettings, slicingDirections):
                         currentBedToNozzleDistance = abs(z)/np.sin(theta) # We want this to be larger than 12.0 mm
                         if currentBedToNozzleDistance < minAcceptableBedToNozzleClearance: # Invalid Point (Collision detected between bed and nozzle)
                             stopSlicing = True
+                            # On retient le detail : sans lui, l'utilisateur ne sait
+                            # ni quel plan ni de combien il faut reculer.
+                            collisionDetail = {
+                                "chunk": chunk,
+                                "layer": layer,
+                                "z": float(z),
+                                "distance": float(currentBedToNozzleDistance),
+                                "minimum": minAcceptableBedToNozzleClearance,
+                            }
         return stopSlicing
 
 
@@ -963,7 +1004,38 @@ def all_5_axis_calculations(mesh, printSettings, slicingDirections):
         argsList = zip([currentChunk]*len(slice_levels), [currentNormal]*len(slice_levels), [currentStart]*len(slice_levels), slice_levels)  # Need to have an argsList with mesh repeated multiple times to get around problem with having mesh as a non-global variable
         with concurrent.futures.ProcessPoolExecutor(max_workers=workerBees) as executor:
             meshSections = list(executor.map(apply_slicing_function_5_axis, argsList))
-        shapely_polygons_list = [[Polygon(p) for p in layer.polygons_full] if layer is not None else [] for layer in meshSections]  # Takes no time (Not worth parallelizing)
+        # Les sections transverses sont calculees paresseusement par trimesh
+        # (layer.polygons_full). Quand une section est degeneree ou
+        # auto-intersectante, trimesh leve une exception opaque qui ne dit ni
+        # quel plan de coupe ni quelle hauteur est en cause. On la rattrape
+        # pour nommer le fautif -- c'est la seule information qui permette a
+        # l'utilisateur de corriger (deplacer ou reorienter ce plan).
+        shapely_polygons_list = []
+        for _layerIdx, _layer in enumerate(meshSections):
+            if _layer is None:
+                shapely_polygons_list.append([])
+                continue
+            try:
+                shapely_polygons_list.append([Polygon(p) for p in _layer.polygons_full])
+            except Exception as _e:
+                _theta, _phi = directions[k]
+                _z = slice_levels[_layerIdx] if _layerIdx < len(slice_levels) else float("nan")
+                raise RuntimeError(
+                    f"Section transverse invalide.\n"
+                    f"  plan de coupe #{k} : theta={_theta} deg, phi={_phi} deg, "
+                    f"origine={list(currentStart)}\n"
+                    f"  couche #{_layerIdx} sur {len(meshSections)}, z={_z} mm "
+                    f"(repere local du chunk)\n"
+                    f"  cause : {type(_e).__name__}: {_e}\n"
+                    f"  note : le chunk #{k} a ete taille par les plans "
+                    f"suivants (chiselling). En pratique la section fautive "
+                    f"tombe souvent juste sous une de ces coupes, ou le cap "
+                    f"genere par slice_plane() est degenere -- ce n'est pas "
+                    f"forcement le plan #{k} lui-meme qui est mal place.\n"
+                    f"  piste : essayer d'autres hauteurs/angles pour les "
+                    f"plans qui bordent ce chunk. Deplacer un plan deplace "
+                    f"l'echec avec lui plutot que de le supprimer."
+                ) from _e
         transform3DList = [layer.metadata["to_3D"] if layer is not None else np.array([]) for layer in meshSections]  # Takes no time (Not worth parallelizing)
 
 
@@ -1044,8 +1116,20 @@ def all_5_axis_calculations(mesh, printSettings, slicingDirections):
             print('__________________________________')
             print(' ')
         else:
-            print('Slicing Stopped. Detected collision between bed and nozzle.')
-            break
+            # Auparavant : print + break, puis retour de dictionnaires incomplets
+            # -> le KeyError tombait plus tard chez write_5_axis_gcode, sans rapport
+            # visible avec la cause. On leve ici, avec le detail.
+            _d = collisionDetail or {}
+            _theta, _phi = directions[_d.get("chunk", k)] if _d else (float("nan"),) * 2
+            raise RuntimeError(
+                f"Collision plateau-buse : le plan de coupe #{_d.get('chunk', k)} "
+                f"(theta={_theta} deg, phi={_phi} deg) incline trop la piece.\n"
+                f"  couche #{_d.get('layer', '?')}, z={_d.get('z', float('nan')):.2f} mm\n"
+                f"  garde disponible {_d.get('distance', float('nan')):.2f} mm "
+                f"< minimum requis {_d.get('minimum', 12.0):.1f} mm\n"
+                f"  piste : reduire l'angle theta de ce plan, ou le remonter pour "
+                f"que la matiere concernee soit plus loin de l'axe de rotation."
+            )
     
     return chunk_transform3DList, adhesionList, chunk_shellRingsListList, chunk_optimizedInternalInfills, chunk_optimizedSolidInfills
 

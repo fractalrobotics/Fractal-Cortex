@@ -913,7 +913,7 @@ class Radio_Button(glooey.RadioButton):
 """ CHECKBOX CLASS """
 
 class Checkbox(glooey.Checkbox):
-    pyglet.resource.path = [".", "image_resources/Checkbox_Images"]
+    pyglet.resource.path = [".", "image_resources/CheckBox_Images"]
     pyglet.resource.reindex()
     custom_checked_base = pyglet.resource.image("checkedBase.png")
     custom_checked_over = pyglet.resource.image("checkedOver.png")

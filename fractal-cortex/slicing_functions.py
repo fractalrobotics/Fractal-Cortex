@@ -53,6 +53,11 @@ Contains all calculations related to 3-axis and 5-axis slicing operations.
 infillType = "Triangular"
 buildRadius = 150.0  # mm
 
+# ArtPrint machine settings
+ROTARY_STEPPER = "stepper_a"   # Klipper manual_stepper that rotates the bed about Z
+ROTATION_SPEED = 25.0          # deg/s
+ROTATION_CLEARANCE_Z = 10.0    # mm the head is lifted above the highest printed point before the bed rotates
+
 
 # DEFINE FUNCTIONS
 def slicing_function(mesh, z):
@@ -1124,44 +1129,46 @@ def slice_in_5_axes(printSettings, meshData, slicingDirections):
 def write_5_axis_gcode(newFile, savedFileName, printSettings, startingPositions, directions, chunk_transform3DList, adhesionList, chunk_shellRingsListList, chunk_optimizedInternalInfills, chunk_optimizedSolidInfills):
 
     def transcribe_pathPoints_to_gcode(pathPoints, PRINT_FEEDRATE, runOnce, newChunk):
+        """Write one path as G-Code. Each point is (x, y, z) at mid-layer height, in machine coordinates.
+        On ArtPrint the bed never tilts, so a tilted layer stays tilted: X, Y and Z can all change along a path."""
         global E, previousE
 
         for p in range(len(pathPoints)):
             point = pathPoints[p]
             X = round(point[0], 5)
             Y = round(point[1], 5)
-            if p == 0:  # If it's the first point in the path
+            Z = round(point[2] + 0.5 * layerHeight, 5)  # The nozzle tip sits half a layer above the slice plane
+            if p == 0:  # If it's the first point in the path, travel to it
                 if enableRetraction == True:
                     openFile.write("G1 F" + str(E_FEEDRATE) + " E" + str(round(E - retractionDistance, 5)) + " ; Retraction" + "\n")
+                # Always go up before moving sideways and come down last, so travels never drag the nozzle through the part
+                travelZ = max(nozzleState['Z'], Z)
                 if enableZHop == True:
-                    openFile.write("G0 F" + str(G0Z_FEEDRATE) + " Z" + str(round(nozzleHeight + layerHeight, 5)) + "\n")
+                    travelZ += layerHeight
                 if newChunk == True:
-                    openFile.write("G0 F" + str(G0Z_FEEDRATE) + " Z" + str(round(nozzleHeight + 30.0 + layerHeight, 5)) + "\n")
+                    travelZ += 30.0
                     newChunk = False
-                if runOnce == True:  # If both the G0 and G1 feedrate for this feature hasn't yet been set on this layer
-                    openFile.write("G0 F" + str(G0XY_FEEDRATE) + " X" + str(X) + " Y" + str(Y) + "\n")
-                else:  # If it's the first point in the path and G0 and G1 feedrates have already been set
-                    openFile.write("G0 F" + str(G0XY_FEEDRATE) + " X" + str(X) + " Y" + str(Y) + "\n") # ("G0 F" + str(G0XY_FEEDRATE) + " X" + str(X) + " Y" + str(Y) + "\n")
-                    if enableZHop == True:
-                        openFile.write("G0 F" + str(G0Z_FEEDRATE) + " Z" + str(round(nozzleHeight, 5)) + "\n")
-                    if enableRetraction == True:
-                        openFile.write("G1 F" + str(E_FEEDRATE) + " E" + str(round(E, 5)) + " ; Reversed Retraction" + "\n")
+                if travelZ != nozzleState['Z']:
+                    openFile.write("G0 F" + str(G0Z_FEEDRATE) + " Z" + str(round(travelZ, 5)) + "\n")
+                openFile.write("G0 F" + str(G0XY_FEEDRATE) + " X" + str(X) + " Y" + str(Y) + "\n")
+                if Z != travelZ:
+                    openFile.write("G0 F" + str(G0Z_FEEDRATE) + " Z" + str(Z) + "\n")
+                if enableRetraction == True:
+                    openFile.write("G1 F" + str(E_FEEDRATE) + " E" + str(round(E, 5)) + " ; Reversed Retraction" + "\n")
             else:  # If it's any point other than the first point in the path
-                s = ((X - previousX) ** 2 + (Y - previousY) ** 2) ** 0.5  # Calculate Euclidian distance
+                s = ((X - previousX) ** 2 + (Y - previousY) ** 2 + (Z - previousZ) ** 2) ** 0.5  # Calculate Euclidian distance in 3D
                 E += ((4.0 * layerHeight * lineWidth * s) / (np.pi * (1.75**2)))  # Use conservation of mass to determine length of 1.75mm filament to extrude
-                if runOnce == True:  # If both the G0 and G1 feedrate for this feature hasn't yet been set on this layer
-                    if enableZHop == True:
-                        openFile.write("G0 F" + str(G0Z_FEEDRATE) + " Z"+ str(round(nozzleHeight, 5)) + "\n")
-                    if enableRetraction == True:
-                        openFile.write("G1 F" + str(E_FEEDRATE) + " E" + str(round(previousE, 5)) + " ; Reversed Retraction" + "\n")
-                    openFile.write("G1 F" + str(PRINT_FEEDRATE) + " X" + str(X) + " Y"+ str(Y) + " E" + str(round(E, 5)) + "\n")
-                    runOnce = False
-                else:  # If it's the second (or any following) points on the path and the G0 and G1 feedrates have already been set
-                    openFile.write("G1 F" + str(PRINT_FEEDRATE) + " X" + str(X) + " Y"+ str(Y) + " E" + str(round(E, 5)) + "\n") # ("G1 X" + str(X) + " Y" + str(Y) + " E" + str(round(E, 5)) + "\n")
+                if Z != previousZ:
+                    openFile.write("G1 F" + str(PRINT_FEEDRATE) + " X" + str(X) + " Y" + str(Y) + " Z" + str(Z) + " E" + str(round(E, 5)) + "\n")
+                else:
+                    openFile.write("G1 F" + str(PRINT_FEEDRATE) + " X" + str(X) + " Y" + str(Y) + " E" + str(round(E, 5)) + "\n")
                 previousE = E
 
             previousX = X
             previousY = Y
+            previousZ = Z
+            nozzleState['Z'] = Z
+            nozzleState['maxZ'] = max(nozzleState['maxZ'], Z)
 
     def rotate_coordinates(coords, phi):
         """Rotate 2D coordinates about the Z-axis by a given angle."""
@@ -1200,7 +1207,7 @@ def write_5_axis_gcode(newFile, savedFileName, printSettings, startingPositions,
                 
                 printable_coords_3d = np.array([np.matmul(DCM_AB, point3D) for point3D in coords_3d])
 
-                layerPaths.append([(point[0], point[1]) for point in printable_coords_3d])
+                layerPaths.append([(point[0], point[1], point[2]) for point in printable_coords_3d])  # Keep Z: tilted layers are not flat on ArtPrint
             printable_pathPoints.append(layerPaths)
             midLayer_Z_Heights.append(printable_coords_3d[0][2])
 
@@ -1226,7 +1233,7 @@ def write_5_axis_gcode(newFile, savedFileName, printSettings, startingPositions,
                 
                 printable_coords_3d = np.array([np.matmul(DCM_AB, point3D) for point3D in coords_3d])
 
-                layerPaths.append([(point[0], point[1]) for point in printable_coords_3d])
+                layerPaths.append([(point[0], point[1], point[2]) for point in printable_coords_3d])  # Keep Z: tilted layers are not flat on ArtPrint
             printable_pathPoints.append(layerPaths)
 
         return printable_pathPoints
@@ -1263,28 +1270,15 @@ def write_5_axis_gcode(newFile, savedFileName, printSettings, startingPositions,
     G1XY_FEEDRATE_SOLIDINFILL = G1XY_FEEDRATE  # mm/min (PLACEHOLDER)
     G1XY_FEEDRATE_INTERNALINFILL = G1XY_FEEDRATE  # mm/min (PLACEHOLDER)
 
-    AB_FEEDRATE = 25.0
-
-    
-    ASPEED_Scaled = []
-    BSPEED_Scaled = []
-    ASPEED_Scaled.append(AB_FEEDRATE)
-    BSPEED_Scaled.append(AB_FEEDRATE)
+    # ArtPrint: the bed only rotates about Z (A axis). It never tilts, so there is no B axis on the bed.
+    # A turns the bed so the slope of each tilted chunk faces +Y, where the tilting head will lean (step 2).
     directions = np.array(directions)
     directions[:, 1] = 90 - directions[:, 1]
     directions[0] = [0.0, 0.0]
     AMOVE_Degrees = [sublist[1] for sublist in directions]
-    AMOVE_Degrees.append(0.0)
-    BMOVE_Degrees = [sublist[0] for sublist in directions]
-    BMOVE_Degrees.append(0.0)
+    TILT_Degrees = [sublist[0] for sublist in directions]  # Tilt of each chunk's layers, not yet compensated by the head
 
-    for d in range(len(AMOVE_Degrees)):
-        if d > 0:
-            currentAMove_Relative = AMOVE_Degrees[d] - AMOVE_Degrees[d-1]
-            currentBMove_Relative = BMOVE_Degrees[d] - BMOVE_Degrees[d-1]
-            ABTheta = np.arctan2(currentBMove_Relative, currentAMove_Relative)
-            ASPEED_Scaled.append(abs(AB_FEEDRATE*np.cos(ABTheta)))
-            BSPEED_Scaled.append(abs(AB_FEEDRATE*np.sin(ABTheta)))
+    nozzleState = {'Z': 30.0, 'maxZ': 30.0}  # Current and highest nozzle Z, used to clear the part before the bed rotates
 
     openFile = open(newFile, "w")
 
@@ -1349,33 +1343,28 @@ def write_5_axis_gcode(newFile, savedFileName, printSettings, startingPositions,
         optimizedSolidInfills = chunk_optimizedSolidInfills[key]
         optimizedInternalInfills = chunk_optimizedInternalInfills[key]
 
-        theta = BMOVE_Degrees[int(key)]*(np.pi/180.0)
         phi = AMOVE_Degrees[int(key)]*(np.pi/180.0)
-        DCM_AB = np.eye(3) 
+        DCM_AB = np.eye(3)
 
-        if key != '0': # If it's not the initial chunk, do some preparation to handle the extra 2 axes
+        if key != '0': # If it's not the initial chunk, rotate the bed for this chunk
             newChunk = True
-            if round(ASPEED_Scaled[int(key)], 5) != 0 and round(BSPEED_Scaled[int(key)], 5) != 0:
-                openFile.write("G0 F" + str(G0Z_FEEDRATE) + " Z" + str(round(nozzleHeight, 5) + 10.0) + "; Moving Z axis to clear A & B Motion" + "\n")
-                openFile.write('G0 X0.0 Y-175.0' + '; Moving Print Head to clear A & B Motion' + '\n')
-                openFile.write('MANUAL_STEPPER STEPPER=stepper_a MOVE=' + str(round(AMOVE_Degrees[int(key)], 5)) + ' SPEED=' + str(round(ASPEED_Scaled[int(key)], 5)) + ' SYNC=0' + '\n')
-                openFile.write('MANUAL_STEPPER STEPPER=stepper_b MOVE=' + str(round(BMOVE_Degrees[int(key)], 5)) + ' SPEED=' + str(round(BSPEED_Scaled[int(key)], 5)) + ' SYNC=1' + ' STOP_ON_ENDSTOP=2' + '\n')
-            elif round(ASPEED_Scaled[int(key)], 5) == 0 and round(BSPEED_Scaled[int(key)], 5) != 0:
-                openFile.write("G0 F" + str(G0Z_FEEDRATE) + " Z" + str(round(nozzleHeight, 5) + 10.0) + "; Moving Z axis to clear A & B Motion" + "\n")
-                openFile.write('G0 X0.0 Y-175.0' + '; Moving Print Head to clear A & B Motion' + '\n')
-                openFile.write('MANUAL_STEPPER STEPPER=stepper_b MOVE=' + str(round(BMOVE_Degrees[int(key)], 5)) + ' SPEED=' + str(round(BSPEED_Scaled[int(key)], 5)) + ' SYNC=1' + ' STOP_ON_ENDSTOP=2' + '\n')
-            elif round(ASPEED_Scaled[int(key)], 5) != 0 and round(BSPEED_Scaled[int(key)], 5) == 0:
-                openFile.write("G0 F" + str(G0Z_FEEDRATE) + " Z" + str(round(nozzleHeight, 5) + 10.0) + "; Moving Z axis to clear A & B Motion" + "\n")
-                openFile.write('G0 X0.0 Y-175.0' + '; Moving Print Head to clear A & B Motion' + '\n')
-                openFile.write('MANUAL_STEPPER STEPPER=stepper_a MOVE=' + str(round(AMOVE_Degrees[int(key)], 5)) + ' SPEED=' + str(round(ASPEED_Scaled[int(key)], 5)) + ' SYNC=1' + '\n')
-            else: # Both ASPEED & BSPEED are zero
-                openFile.write('; No Change in AB Motion Required'+'\n')
+            if round(AMOVE_Degrees[int(key)] - AMOVE_Degrees[int(key)-1], 5) != 0:
+                # Lift the head above everything printed so far, then turn the bed under it.
+                # The bed moves in X/Y on ArtPrint, so no X/Y "park" move is needed to get out of the way.
+                clearanceZ = nozzleState['maxZ'] + ROTATION_CLEARANCE_Z
+                openFile.write("G0 F" + str(G0Z_FEEDRATE) + " Z" + str(round(clearanceZ, 5)) + "; Lifting head to clear bed rotation" + "\n")
+                nozzleState['Z'] = clearanceZ
+                openFile.write('MANUAL_STEPPER STEPPER=' + ROTARY_STEPPER + ' MOVE=' + str(round(AMOVE_Degrees[int(key)], 5)) + ' SPEED=' + str(ROTATION_SPEED) + ' SYNC=1' + '\n')
+            else:
+                openFile.write('; No bed rotation required'+'\n')
+            if round(TILT_Degrees[int(key)], 5) != 0:
+                openFile.write('; WARNING: layers of this chunk are tilted ' + str(round(TILT_Degrees[int(key)], 5)) + ' deg. They need the tilting head (not supported yet)' + '\n')
 
-            openFile.write('; A & B Axis Motion Complete'+'\n')
-            
+            openFile.write('; Bed rotation complete'+'\n')
+
+            # Only the bed rotation is applied: the toolpaths keep their tilt in machine coordinates
             QA = np.array([[np.cos(phi), -np.sin(phi), 0], [np.sin(phi), np.cos(phi), 0], [0, 0, 1]])
-            QB = np.array([[1, 0, 0], [0, np.cos(theta), -np.sin(theta)], [0, np.sin(theta), np.cos(theta)]])
-            DCM_AB = np.matmul(QB, QA)
+            DCM_AB = QA
         elif key == '0':
             newChunk = False
 
@@ -1403,10 +1392,7 @@ def write_5_axis_gcode(newFile, savedFileName, printSettings, startingPositions,
             current3DTransform = transform3DList[k]
 
             if current3DTransform.shape == (4, 4):  # If there is something to print at this layer, do so. Otherwise, there is a vertical gap underneath a floating island in which G-Code shouldn't be generated
-                nozzleHeight = midLayer_Z_Heights[k] + 0.5 * layerHeight # Current height of nozzle
-
-                """ Z COMMAND """
-                openFile.write("G0 F" + str(G0Z_FEEDRATE) + " Z" + str(round(nozzleHeight, 5)) + "\n")
+                # No separate Z command: every point carries its own Z, since tilted layers are not flat on ArtPrint
 
                 if key == '0' and k == 0 and adhesionList[0] != []: # If it's layer zero of the initial chunk and there is adhesion gcode (brims, skirts) to write, do so
                     """ ADHESION FEATURE TITLE """
@@ -1416,7 +1402,7 @@ def write_5_axis_gcode(newFile, savedFileName, printSettings, startingPositions,
                     flattened_adhesion_rings = sum(adhesionList[0], [])
                     flattened_adhesion_rings.reverse() # Reorder brim rings so the outer brim is printed first. That way the nozzle is primed for the innermost part of the brim that contacts the part
 
-                    adhesions = [list(ring.coords) for ring in flattened_adhesion_rings]
+                    adhesions = [[(x, y, midLayer_Z_Heights[0]) for x, y in ring.coords] for ring in flattened_adhesion_rings]  # Brim lies flat on the bed at the first layer height
                     
                     runOnce = True  # True if this is the start of a new feature on this layer (feature means shells, infill, etc.)
                     newChunk = False
@@ -1476,14 +1462,13 @@ def write_5_axis_gcode(newFile, savedFileName, printSettings, startingPositions,
     """ FOOTER """
     openFile.write(";" + "FOOTER:" + "\n")
     openFile.write("G1 F" + str(E_FEEDRATE) + " E" + str(round(E - 2.0, 5)) + " ; Retract for end of print" + "\n") #######
-    openFile.write("G0 F" + str(G0Z_FEEDRATE) + " Z" + str(round(nozzleHeight + layerHeight, 5)) + "\n")
+    openFile.write("G0 F" + str(G0Z_FEEDRATE) + " Z" + str(round(nozzleState['Z'] + layerHeight, 5)) + "\n")
     openFile.write("M140 S0       ;Set bed temp to zero" + "\n")
     openFile.write("M104 S0       ;Set nozzle temp to zero" + "\n")
     openFile.write("G28 Y         ;Home X-Axis" + "\n")
     openFile.write("G28 X         ;Home X-Axis" + "\n")
-    openFile.write('MANUAL_STEPPER STEPPER=stepper_a MOVE=' + str(0.0) + ' SPEED=' + str(round(ASPEED_Scaled[-1], 5)) + ' SYNC=0' + '\n')
-    openFile.write('MANUAL_STEPPER STEPPER=stepper_b MOVE=' + str(0.0) + ' SPEED=' + str(round(BSPEED_Scaled[-1], 5)) + ' SYNC=1' + ' STOP_ON_ENDSTOP=2' + '\n')
-    openFile.write(';A & B Axes Homed'+'\n')
+    openFile.write('MANUAL_STEPPER STEPPER=' + ROTARY_STEPPER + ' MOVE=' + str(0.0) + ' SPEED=' + str(ROTATION_SPEED) + ' SYNC=1' + '\n')
+    openFile.write(';Bed rotation back to zero'+'\n')
     openFile.write(";" + "End of GCODE" + "\n")
 
     openFile.close()
@@ -1703,7 +1688,6 @@ def write_3_axis_gcode(newFile, savedFileName, printSettings, transform3DList, a
     openFile.write("G28 Y         ;Home X-Axis" + "\n")
     openFile.write("G28 X         ;Home X-Axis" + "\n")
     openFile.write("MANUAL_STEPPER STEPPER=stepper_a MOVE=0.0 SPEED=24.43822 SYNC=0" + "\n")
-    openFile.write("MANUAL_STEPPER STEPPER=stepper_b MOVE=0.0 SPEED=5.27003 SYNC=1 STOP_ON_ENDSTOP=2" + "\n")
     openFile.write(";" + "A & B Axes Homed" + "\n")
     openFile.write(";" + "End of GCODE" + "\n")
 

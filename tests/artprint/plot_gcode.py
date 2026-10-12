@@ -1,4 +1,4 @@
-"""Draw the extrusion paths of a G-code file in 3D and save a PNG (one color per chunk).
+"""Draw the extrusion paths of a G-code file in 3D, as they end up on the part (bed rotation undone), and save a PNG.
 Usage: python plot_gcode.py <file.gcode> <out.png>"""
 import sys
 import matplotlib
@@ -6,10 +6,11 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d.art3d import Line3DCollection
 from matplotlib.lines import Line2D
+from check_gcode import to_bed
 
 def extrusion_segments(path):
     """Return chunk -> list of ((x0, y0, z0), (x1, y1, z1)) for every move that extrudes."""
-    x = y = z = e = 0.0; chunk = 0; segs = {0: []}
+    x = y = z = a = e = 0.0; chunk = 0; segs = {0: []}
     for line in open(path):
         if line.startswith(';Chunk '):
             chunk = int(line.split()[1]); segs[chunk] = []
@@ -17,10 +18,10 @@ def extrusion_segments(path):
         if not code.startswith(('G0', 'G1')):
             continue
         v = dict((m[0], float(m[1:])) for m in code.split()[1:])
-        nx, ny, nz = v.get('X', x), v.get('Y', y), v.get('Z', z)
+        nx, ny, nz, na = v.get('X', x), v.get('Y', y), v.get('Z', z), v.get('A', a)
         if v.get('E', e) > e and ('X' in v or 'Y' in v):
-            segs[chunk].append(((x, y, z), (nx, ny, nz)))
-        x, y, z, e = nx, ny, nz, v.get('E', e)
+            segs[chunk].append((tuple(to_bed(x, y, a)) + (z,), tuple(to_bed(nx, ny, na)) + (nz,)))
+        x, y, z, a, e = nx, ny, nz, na, v.get('E', e)
     return segs
 
 segs = extrusion_segments(sys.argv[1])

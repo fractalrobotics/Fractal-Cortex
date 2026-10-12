@@ -7,7 +7,7 @@ import os, subprocess, sys
 HERE = os.path.dirname(os.path.abspath(__file__))
 CODE = os.path.join(HERE, '..', '..', 'fractal-cortex')
 OUT = os.path.join(HERE, 'output'); os.makedirs(OUT, exist_ok=True)
-CASES = {'flat': 0, 'tilt45': 45, 'tilt45_phi90': 45}  # case name -> tilt angle of chunk 1 (deg)
+CASES = {'flat': 0, 'tilt45': 45, 'tilt45_phi90': 45, 'ring': 0, 'far_half': 0}  # case name -> tilt angle of chunk 1 (deg)
 LAYER_HEIGHT = '0.4'
 
 failed = False

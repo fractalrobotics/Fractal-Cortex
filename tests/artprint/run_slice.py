@@ -18,11 +18,21 @@ CASES = {
     "tilt45": [2, [[0.0, 0.0, 0.0], [15.0, 0.0, 10.0]], [[0.0, 0.0], [45.0, 0.0]]],
     # same but facing +Y (phi = 90) to check the bed rotation
     "tilt45_phi90": [2, [[0.0, 0.0, 0.0], [0.0, 15.0, 10.0]], [[0.0, 0.0], [45.0, 90.0]]],
+    # a thin ring of 200 mm around the bed centre: the bed has to turn while each loop is printed
+    "ring": [1, [[0.0, 0.0, 0.0]], [[0.0, 0.0]]],
+    # a block on the far half of the bed (Y < 0), which the nozzle cannot reach without turning the bed
+    "far_half": [1, [[0.0, 0.0, 0.0]], [[0.0, 0.0]]],
 }
 
 if __name__ == "__main__":
     case, out = sys.argv[2], sys.argv[3]
     mesh = make_part()
+    if case == "ring":
+        outer = trimesh.creation.cylinder(radius=100, height=2.0, sections=128)
+        inner = trimesh.creation.cylinder(radius=95, height=4.0, sections=128)
+        mesh = trimesh.boolean.difference([outer, inner]); mesh.apply_translation([0, 0, 1.0])
+    if case == "far_half":
+        mesh = trimesh.creation.box(extents=[40, 30, 4]); mesh.apply_translation([20, -90, 2])
     if case == "tilt45_phi90":
         mesh.apply_transform(trimesh.transformations.rotation_matrix(1.5707963267948966, [0, 0, 1]))
     meshData = [[0], {0: mesh}]

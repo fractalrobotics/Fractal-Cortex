@@ -57,6 +57,10 @@ buildRadius = 150.0  # mm
 ROTARY_STEPPER = "stepper_a"   # Klipper manual_stepper that rotates the bed about Z
 ROTATION_SPEED = 25.0          # deg/s
 ROTATION_CLEARANCE_Z = 10.0    # mm the head is lifted above the highest printed point before the bed rotates
+X_HALF_TRAVEL = 150.0          # mm the bed can move forward or back from the centred position (to confirm)
+Y_TRAVEL = 150.0               # mm useful nozzle travel, from the bed's rotation centre to its edge
+MAX_SWEEP_DEG = 180.0          # Largest angle a path may wrap around the centre before the bed has to turn while printing it (the nozzle covers half the bed)
+MAX_A_STEP_DEG = 0.5           # Largest bed rotation on one G-Code line while the bed turns during a path
 
 
 # DEFINE FUNCTIONS
@@ -1128,16 +1132,79 @@ def slice_in_5_axes(printSettings, meshData, slicingDirections):
 
 def write_5_axis_gcode(newFile, savedFileName, printSettings, startingPositions, directions, chunk_transform3DList, adhesionList, chunk_shellRingsListList, chunk_optimizedInternalInfills, chunk_optimizedSolidInfills):
 
+    def path_to_machine_coordinates(pathPoints, fixedA):
+        """Convert one path from bed coordinates to ArtPrint machine coordinates.
+        Each input point is (x, y, z) in the bed's own frame, with (0, 0) at the bed's rotation centre.
+        Each output point is (X, Y, Z, A, bedPoint): the bed is turned by A degrees, then moved so the
+        point lands under the nozzle at (X, Y). The nozzle only reaches the +Y half of the bed (0 <= Y <= Y_TRAVEL),
+        so when a path wraps too far around the centre, the bed turns while the path is printed.
+        fixedA: bed angle for chunks whose layers are tilted (the bed must not turn during them), else None."""
+        bedPoints = np.array(pathPoints, dtype=float)
+        if fixedA is not None:
+            a = np.radians(fixedA)
+            Q = np.array([[np.cos(a), -np.sin(a), 0], [np.sin(a), np.cos(a), 0], [0, 0, 1]])
+            return [(q[0], q[1], q[2], fixedA, p) for q, p in zip(bedPoints @ Q.T, bedPoints)]
+
+        def polar_angle(p, previousAngle):  # Angle of a point around the bed centre, unwrapped to stay close to the previous one
+            if np.hypot(p[0], p[1]) < 1e-6:
+                return previousAngle
+            angle = np.degrees(np.arctan2(p[1], p[0]))
+            return angle + 360.0 * np.round((previousAngle - angle) / 360.0)
+
+        angles = [polar_angle(bedPoints[0], 90.0)]
+        for p in bedPoints[1:]:
+            angles.append(polar_angle(p, angles[-1]))
+        sweep = max(angles) - min(angles)
+        # Share of the path's turn done by the nozzle side (c = 1: bed stays still; c < 1: bed turns by the rest)
+        c = 1.0 if sweep <= MAX_SWEEP_DEG else MAX_SWEEP_DEG / sweep
+        midAngle = 0.5 * (max(angles) + min(angles))
+
+        # Straight lines on the bed become curves once the bed turns, so cut segments into small steps.
+        # Near the centre the angle changes fast, so keep halving a step until the bed turns little enough on it.
+        points = [(bedPoints[0], angles[0])]
+        for k in range(1, len(bedPoints)):
+            if c == 1.0:  # Bed does not turn on this path: straight lines stay straight
+                points.append((bedPoints[k], angles[k]))
+                continue
+            pending = [1.0]  # Fractions of the segment still to reach, last one first
+            done = 0.0
+            while pending:
+                t = pending[-1]
+                p = bedPoints[k-1] + (bedPoints[k] - bedPoints[k-1]) * t
+                angle = polar_angle(p, points[-1][1])
+                if abs(angle - points[-1][1]) * (1.0 - c) > MAX_A_STEP_DEG and t - done > 1e-6:
+                    pending.append(0.5 * (done + t))
+                else:
+                    points.append((p, angle))
+                    done = pending.pop()
+
+        machinePoints = []
+        for p, angle in points:
+            psi = 90.0 + c * (angle - midAngle)  # Where the point ends up around the centre, seen from the machine (90 = +Y)
+            A = psi - angle                       # Bed rotation that puts it there
+            r = np.hypot(p[0], p[1])
+            machinePoints.append([r * np.cos(np.radians(psi)), r * np.sin(np.radians(psi)), p[2], A, p])
+        # Pick the equivalent bed angle (give or take whole turns) that keeps this path's angles closest to zero,
+        # so the bed never winds up turn after turn (its heater wires could not follow)
+        midA = 0.5 * (max(m[3] for m in machinePoints) + min(m[3] for m in machinePoints))
+        shift = -360.0 * np.round(midA / 360.0)
+        for m in machinePoints:
+            m[3] += shift
+        return machinePoints
+
     def transcribe_pathPoints_to_gcode(pathPoints, PRINT_FEEDRATE, runOnce, newChunk):
-        """Write one path as G-Code. Each point is (x, y, z) at mid-layer height, in machine coordinates.
-        On ArtPrint the bed never tilts, so a tilted layer stays tilted: X, Y and Z can all change along a path."""
+        """Write one path as G-Code. Each point is (x, y, z) at mid-layer height, in bed coordinates.
+        X, Y, Z and the bed angle A can all change along a path on ArtPrint."""
         global E, previousE
 
-        for p in range(len(pathPoints)):
-            point = pathPoints[p]
-            X = round(point[0], 5)
-            Y = round(point[1], 5)
-            Z = round(point[2] + 0.5 * layerHeight, 5)  # The nozzle tip sits half a layer above the slice plane
+        machinePoints = path_to_machine_coordinates(pathPoints, nozzleState['fixedA'])
+        for p, (mx, my, mz, mA, bedPoint) in enumerate(machinePoints):
+            X = round(mx, 5)
+            Y = round(my, 5)
+            Z = round(mz + 0.5 * layerHeight, 5)  # The nozzle tip sits half a layer above the slice plane
+            A = round(mA, 4)
+            if abs(X) > X_HALF_TRAVEL + 1e-3 or Y < -1e-3 or Y > Y_TRAVEL + 1e-3:
+                nozzleState['outOfReach'] += 1
             if p == 0:  # If it's the first point in the path, travel to it
                 if enableRetraction == True:
                     openFile.write("G1 F" + str(E_FEEDRATE) + " E" + str(round(E - retractionDistance, 5)) + " ; Retraction" + "\n")
@@ -1150,24 +1217,35 @@ def write_5_axis_gcode(newFile, savedFileName, printSettings, startingPositions,
                     newChunk = False
                 if travelZ != nozzleState['Z']:
                     openFile.write("G0 F" + str(G0Z_FEEDRATE) + " Z" + str(round(travelZ, 5)) + "\n")
-                openFile.write("G0 F" + str(G0XY_FEEDRATE) + " X" + str(X) + " Y" + str(Y) + "\n")
+                if A != nozzleState['A']:
+                    openFile.write("G0 F" + str(G0XY_FEEDRATE) + " X" + str(X) + " Y" + str(Y) + " A" + str(A) + "\n")
+                else:
+                    openFile.write("G0 F" + str(G0XY_FEEDRATE) + " X" + str(X) + " Y" + str(Y) + "\n")
                 if Z != travelZ:
                     openFile.write("G0 F" + str(G0Z_FEEDRATE) + " Z" + str(Z) + "\n")
                 if enableRetraction == True:
                     openFile.write("G1 F" + str(E_FEEDRATE) + " E" + str(round(E, 5)) + " ; Reversed Retraction" + "\n")
             else:  # If it's any point other than the first point in the path
-                s = ((X - previousX) ** 2 + (Y - previousY) ** 2 + (Z - previousZ) ** 2) ** 0.5  # Calculate Euclidian distance in 3D
+                s = float(np.linalg.norm(bedPoint - previousBedPoint))  # Real length of filament laid on the part
                 E += ((4.0 * layerHeight * lineWidth * s) / (np.pi * (1.75**2)))  # Use conservation of mass to determine length of 1.75mm filament to extrude
+                # Klipper times a move by its X/Y/Z length only. When the bed turns, that length differs from the
+                # real length on the part, so scale the feedrate to keep the real printing speed.
+                machineDistance = ((X - previousX) ** 2 + (Y - previousY) ** 2 + (Z - previousZ) ** 2) ** 0.5
+                feedrate = PRINT_FEEDRATE * machineDistance / s if s > 1e-9 and machineDistance > 1e-9 else PRINT_FEEDRATE
+                line = "G1 F" + str(round(feedrate, 3)) + " X" + str(X) + " Y" + str(Y)
                 if Z != previousZ:
-                    openFile.write("G1 F" + str(PRINT_FEEDRATE) + " X" + str(X) + " Y" + str(Y) + " Z" + str(Z) + " E" + str(round(E, 5)) + "\n")
-                else:
-                    openFile.write("G1 F" + str(PRINT_FEEDRATE) + " X" + str(X) + " Y" + str(Y) + " E" + str(round(E, 5)) + "\n")
+                    line += " Z" + str(Z)
+                if A != nozzleState['A']:
+                    line += " A" + str(A)
+                openFile.write(line + " E" + str(round(E, 5)) + "\n")
                 previousE = E
 
             previousX = X
             previousY = Y
             previousZ = Z
+            previousBedPoint = bedPoint
             nozzleState['Z'] = Z
+            nozzleState['A'] = A
             nozzleState['maxZ'] = max(nozzleState['maxZ'], Z)
 
     def rotate_coordinates(coords, phi):
@@ -1278,7 +1356,7 @@ def write_5_axis_gcode(newFile, savedFileName, printSettings, startingPositions,
     AMOVE_Degrees = [sublist[1] for sublist in directions]
     TILT_Degrees = [sublist[0] for sublist in directions]  # Tilt of each chunk's layers, not yet compensated by the head
 
-    nozzleState = {'Z': 30.0, 'maxZ': 30.0}  # Current and highest nozzle Z, used to clear the part before the bed rotates
+    nozzleState = {'Z': 30.0, 'maxZ': 30.0, 'A': 0.0, 'fixedA': None, 'outOfReach': 0}  # Current and highest nozzle Z, bed angle, moves the nozzle cannot reach
 
     openFile = open(newFile, "w")
 
@@ -1311,6 +1389,7 @@ def write_5_axis_gcode(newFile, savedFileName, printSettings, startingPositions,
     openFile.write(";" + "--------------------------" + "\n")
     openFile.write("G28                   ;Home X, Y, & Z axes" + "\n")
     openFile.write("home_ab               ;Home B Axis and Enable A Axis" + "\n")
+    openFile.write("MANUAL_STEPPER STEPPER=" + ROTARY_STEPPER + " GCODE_AXIS=A ;Bed rotation becomes axis A on G1 moves" + "\n")
     openFile.write("M140 S" + str(initialBedTemp) + "            ;Set initial bed temp" + "\n")
     openFile.write("M105                  ;Get nozzle temp" + "\n")
     openFile.write("M190 S" + str(initialBedTemp) + "            ;Set initial bed temperature and wait" + "\n")
@@ -1343,29 +1422,24 @@ def write_5_axis_gcode(newFile, savedFileName, printSettings, startingPositions,
         optimizedSolidInfills = chunk_optimizedSolidInfills[key]
         optimizedInternalInfills = chunk_optimizedInternalInfills[key]
 
-        phi = AMOVE_Degrees[int(key)]*(np.pi/180.0)
-        DCM_AB = np.eye(3)
+        DCM_AB = np.eye(3)  # Toolpaths stay in bed coordinates; the bed angle is worked out point by point when writing G-Code
+        tilted = round(TILT_Degrees[int(key)], 5) != 0
+        # A tilted chunk is printed with the bed held at one angle, so its slope faces the side the head will lean to.
+        # A flat chunk can be printed in any orientation, so the bed is free to turn while it prints.
+        nozzleState['fixedA'] = AMOVE_Degrees[int(key)] - 360.0 * np.round(AMOVE_Degrees[int(key)] / 360.0) if tilted else None
 
-        if key != '0': # If it's not the initial chunk, rotate the bed for this chunk
+        if key != '0': # If it's not the initial chunk, get ready for the new orientation
             newChunk = True
-            if round(AMOVE_Degrees[int(key)] - AMOVE_Degrees[int(key)-1], 5) != 0:
-                # Lift the head above everything printed so far, then turn the bed under it.
-                # The bed moves in X/Y on ArtPrint, so no X/Y "park" move is needed to get out of the way.
-                clearanceZ = nozzleState['maxZ'] + ROTATION_CLEARANCE_Z
-                openFile.write("G0 F" + str(G0Z_FEEDRATE) + " Z" + str(round(clearanceZ, 5)) + "; Lifting head to clear bed rotation" + "\n")
-                nozzleState['Z'] = clearanceZ
-                openFile.write('MANUAL_STEPPER STEPPER=' + ROTARY_STEPPER + ' MOVE=' + str(round(AMOVE_Degrees[int(key)], 5)) + ' SPEED=' + str(ROTATION_SPEED) + ' SYNC=1' + '\n')
-            else:
-                openFile.write('; No bed rotation required'+'\n')
-            if round(TILT_Degrees[int(key)], 5) != 0:
+            # Lift the head above everything printed so far before the bed turns under it.
+            # The bed moves in X on ArtPrint, so no X/Y "park" move is needed to get out of the way.
+            clearanceZ = nozzleState['maxZ'] + ROTATION_CLEARANCE_Z
+            openFile.write("G0 F" + str(G0Z_FEEDRATE) + " Z" + str(round(clearanceZ, 5)) + "; Lifting head to clear bed rotation" + "\n")
+            nozzleState['Z'] = clearanceZ
+            if tilted:
+                openFile.write("G0 F" + str(ROTATION_SPEED * 60.0) + " A" + str(round(nozzleState['fixedA'], 4)) + " ; Turning the bed for this chunk" + "\n")
+                nozzleState['A'] = round(nozzleState['fixedA'], 4)
                 openFile.write('; WARNING: layers of this chunk are tilted ' + str(round(TILT_Degrees[int(key)], 5)) + ' deg. They need the tilting head (not supported yet)' + '\n')
-
-            openFile.write('; Bed rotation complete'+'\n')
-
-            # Only the bed rotation is applied: the toolpaths keep their tilt in machine coordinates
-            QA = np.array([[np.cos(phi), -np.sin(phi), 0], [np.sin(phi), np.cos(phi), 0], [0, 0, 1]])
-            DCM_AB = QA
-        elif key == '0':
+        else:
             newChunk = False
 
         printable_shell_pathPoints, midLayer_Z_Heights = transform_paths_to_printable_orientation(shellRingsListList, transform3DList, DCM_AB)
@@ -1467,8 +1541,11 @@ def write_5_axis_gcode(newFile, savedFileName, printSettings, startingPositions,
     openFile.write("M104 S0       ;Set nozzle temp to zero" + "\n")
     openFile.write("G28 Y         ;Home X-Axis" + "\n")
     openFile.write("G28 X         ;Home X-Axis" + "\n")
-    openFile.write('MANUAL_STEPPER STEPPER=' + ROTARY_STEPPER + ' MOVE=' + str(0.0) + ' SPEED=' + str(ROTATION_SPEED) + ' SYNC=1' + '\n')
-    openFile.write(';Bed rotation back to zero'+'\n')
+    openFile.write("G0 F" + str(ROTATION_SPEED * 60.0) + " A0.0 ;Bed rotation back to zero" + "\n")
+    openFile.write("MANUAL_STEPPER STEPPER=" + ROTARY_STEPPER + " GCODE_AXIS= ;Back to manual control of the bed rotation" + "\n")
+    if nozzleState['outOfReach'] > 0:
+        openFile.write("; WARNING: " + str(nozzleState['outOfReach']) + " points are outside the nozzle's reach (check X_HALF_TRAVEL and Y_TRAVEL)" + "\n")
+        print("WARNING:", nozzleState['outOfReach'], "points are outside the nozzle's reach")
     openFile.write(";" + "End of GCODE" + "\n")
 
     openFile.close()
